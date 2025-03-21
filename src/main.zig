@@ -262,6 +262,10 @@ pub const NonInteractiveValidator = struct {
         commitment: []const u8,
         proof: []const u8,
     ) bool {
+        var commitment_hash: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(commitment, &commitment_hash, .{});
+        var default_csprng = std.Random.DefaultCsprng.init(commitment_hash);
+        const csprng = default_csprng.random();
         // TODO: assertions
 
         const per_round_commitment_len = canonical_graph.vertex_count * HmacSha256.key_length;
@@ -270,6 +274,10 @@ pub const NonInteractiveValidator = struct {
             const round_commitment = commitment[round * per_round_commitment_len ..][0..per_round_commitment_len];
             const revealed_edge: GraphColoring.RevealEdge =
                 @bitCast(proof[round * @sizeOf(GraphColoring.RevealEdge) ..][0..@sizeOf(GraphColoring.RevealEdge)].*);
+
+            if (@intFromEnum(revealed_edge.edge_index) != csprng.intRangeLessThan(u32, 0, @intCast(canonical_graph.edges.len))) {
+                return false;
+            }
 
             const edge = canonical_graph.edges[@intFromEnum(revealed_edge.edge_index)];
 
