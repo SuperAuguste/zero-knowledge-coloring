@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const CanonicalGraph = struct {
@@ -108,7 +109,7 @@ pub const GraphColoring = struct {
         assert(coloring.keys.len == canonical_graph.vertex_count);
         assert(out.len == coloring.commitmentLength());
         assert(canonical_graph.validate() == .valid);
-        assert(coloring.validate(canonical_graph) == .valid);
+        // assert(coloring.validate(canonical_graph) == .valid);
 
         for (
             coloring.colors[0..canonical_graph.vertex_count],
@@ -124,7 +125,7 @@ pub const GraphColoring = struct {
     }
 
     pub const RevealEdge = extern struct {
-        edge: CanonicalGraph.Edge.Index align(1),
+        edge_index: CanonicalGraph.Edge.Index align(1),
         color_a: Color align(1),
         color_b: Color align(1),
         key_a: Key align(1),
@@ -135,7 +136,7 @@ pub const GraphColoring = struct {
             reveal_edge: RevealEdge,
             canonical_graph: CanonicalGraph,
         ) RevealEdge.ValidationResult {
-            if (reveal_edge.edge >= canonical_graph.edges.len) {
+            if (reveal_edge.edge_index >= canonical_graph.edges.len) {
                 return .edge_out_of_bounds;
             }
 
@@ -153,11 +154,11 @@ pub const GraphColoring = struct {
         assert(@intFromEnum(edge_index) < canonical_graph.edges.len);
         const edge = canonical_graph.edges[@intFromEnum(edge_index)];
         return .{
-            .edge = edge_index,
-            .color_a = coloring.colors[edge.a],
-            .color_b = coloring.colors[edge.b],
-            .key_a = coloring.colors[edge.a],
-            .key_b = coloring.colors[edge.b],
+            .edge_index = edge_index,
+            .color_a = coloring.colors[@intFromEnum(edge.a)],
+            .color_b = coloring.colors[@intFromEnum(edge.b)],
+            .key_a = coloring.keys[@intFromEnum(edge.a)],
+            .key_b = coloring.keys[@intFromEnum(edge.b)],
         };
     }
 };
@@ -224,6 +225,77 @@ pub const GraphColorings = struct {
     }
 };
 
+pub const NonInteractiveProver = struct {
+    pub fn revealRandomEdgeForRound(
+        csprng: std.Random,
+        colorings: GraphColorings,
+        canonical_graph: CanonicalGraph,
+        round: usize,
+    ) GraphColoring.RevealEdge {
+        const coloring = colorings.coloringForRound(canonical_graph, round);
+        return coloring.revealEdge(
+            canonical_graph,
+            @enumFromInt(csprng.intRangeLessThan(u32, 0, @intCast(canonical_graph.edges.len))),
+        );
+    }
+
+    pub fn revealRandomEdges(
+        csprng: std.Random,
+        colorings: GraphColorings,
+        canonical_graph: CanonicalGraph,
+        rounds: usize,
+        out: []u8,
+    ) void {
+        assert(out.len == rounds * @sizeOf(GraphColoring.RevealEdge));
+        for (0..rounds) |round| {
+            @memcpy(
+                out[round * @sizeOf(GraphColoring.RevealEdge) ..][0..@sizeOf(GraphColoring.RevealEdge)],
+                &std.mem.toBytes(revealRandomEdgeForRound(csprng, colorings, canonical_graph, round)),
+            );
+        }
+    }
+};
+
+pub const NonInteractiveValidator = struct {
+    pub fn validate(
+        canonical_graph: CanonicalGraph,
+        commitment: []const u8,
+        proof: []const u8,
+    ) bool {
+        // TODO: assertions
+
+        const per_round_commitment_len = canonical_graph.vertex_count * HmacSha256.key_length;
+
+        for (0..proof.len / @sizeOf(GraphColoring.RevealEdge)) |round| {
+            const round_commitment = commitment[round * per_round_commitment_len ..][0..per_round_commitment_len];
+            const revealed_edge: GraphColoring.RevealEdge =
+                @bitCast(proof[round * @sizeOf(GraphColoring.RevealEdge) ..][0..@sizeOf(GraphColoring.RevealEdge)].*);
+
+            const edge = canonical_graph.edges[@intFromEnum(revealed_edge.edge_index)];
+
+            var out: [HmacSha256.mac_length]u8 = undefined;
+
+            HmacSha256.create(&out, &.{@intFromEnum(revealed_edge.color_a)}, &revealed_edge.key_a);
+            const edge_a_commitment = round_commitment[@intFromEnum(edge.a) * HmacSha256.key_length ..][0..HmacSha256.key_length];
+            if (!std.mem.eql(u8, &out, edge_a_commitment)) {
+                return false;
+            }
+
+            HmacSha256.create(&out, &.{@intFromEnum(revealed_edge.color_b)}, &revealed_edge.key_b);
+            const edge_b_commitment = round_commitment[@intFromEnum(edge.b) * HmacSha256.key_length ..][0..HmacSha256.key_length];
+            if (!std.mem.eql(u8, &out, edge_b_commitment)) {
+                return false;
+            }
+
+            if (revealed_edge.color_a == revealed_edge.color_b) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -258,15 +330,24 @@ pub fn main() !void {
             .green,
             .red,
             .blue,
+            // .red,
             .green,
         },
         list.items(.color),
         list.items(.key),
     );
 
-    var out: [rounds * canonical_graph.vertex_count * @sizeOf(GraphColoring.Key)]u8 = undefined;
-    colorings.createCommitment(canonical_graph, &out);
-    // colorings.coloringForRound(canonical_graph, 0).createCommitment(canonical_graph, &out);
+    var commitment: [rounds * canonical_graph.vertex_count * @sizeOf(GraphColoring.Key)]u8 = undefined;
+    colorings.createCommitment(canonical_graph, &commitment);
 
-    std.log.info("{}", .{std.fmt.fmtSliceHexLower(&out)});
+    var commitment_hash: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(&commitment, &commitment_hash, .{});
+    var default_csprng = std.Random.DefaultCsprng.init(commitment_hash);
+    const csprng = default_csprng.random();
+
+    var proof: [rounds * @sizeOf(GraphColoring.RevealEdge)]u8 = undefined;
+    NonInteractiveProver.revealRandomEdges(csprng, colorings, canonical_graph, rounds, &proof);
+
+    std.log.info("{any}", .{NonInteractiveValidator.validate(canonical_graph, &commitment, &proof)});
+    // std.log.info("{}", .{std.fmt.fmtSliceHexLower(&proof)});
 }

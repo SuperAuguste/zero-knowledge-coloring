@@ -1,5 +1,6 @@
 .{
-    .name = "zero-knowledge-coloring",
+    .name = .zero_knowledge_coloring,
+    .fingerprint = 0x84da8cfb1b90c350,
     .version = "0.0.0",
     .paths = .{
         "build.zig",
